@@ -10,7 +10,6 @@ Written by Fable 5, reviewed by me. Tested on my PSP1000 with ARK4.
 Use at your own risk of course. I can't guarantee this won't conflict with other
 plugins (this is my only plugin).
 
--
 
 A VSH kernel plugin for PSPs running **ARK-4 CFW** that makes the XMB
 Game menu load near-instantly, no matter how many ISOs are on the
