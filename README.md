@@ -150,13 +150,9 @@ the author accepts no liability for any damage arising from its use —
 see sections 15 and 16 of the [LICENSE](LICENSE). Use it at your own
 risk.
 
-That said, the risk profile is worth understanding: the plugin never
-writes to the PSP's firmware flash (`flash0:`/`flash1:`) or IPL — its
-only writes are ordinary files on the memory card. It loads only in
-the XMB, so the worst realistic failure is an XMB freeze, recovered by
-holding the power switch off and disabling the plugin via ARK's
-Recovery Menu (hold R at power-on) or by deleting its line from
-PLUGINS.TXT over USB. It cannot brick a PSP.
+Just in case: an XMB freeze is recovered by holding the power switch
+off and disabling the plugin via ARK's Recovery Menu (hold R at
+power-on) or by deleting its line from PLUGINS.TXT over USB.
 
 ## Credits & license
 
