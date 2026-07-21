@@ -1,5 +1,17 @@
 # xmb_gamecache — fast XMB Game menu for ARK-4 on big memory cards
 
+The load time to show items in my 128GB memory card was so frustrating!
+This plugin caches the data that slowed down you accessing your Game > Memory card.
+
+This plugin also re-arranges items based on "last used" so most recently accessed
+items in your memory card are first.
+
+Written by Fable 5, reviewed by me. Tested on my PSP1000 with ARK4. 
+Use at your own risk of course. I can't guarantee this won't conflict with other
+plugins (this is my only plugin).
+
+-
+
 A VSH kernel plugin for PSPs running **ARK-4 CFW** that makes the XMB
 Game menu load near-instantly, no matter how many ISOs are on the
 card — including after waking from sleep.
