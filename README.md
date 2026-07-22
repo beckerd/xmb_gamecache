@@ -1,5 +1,7 @@
 # xmb_gamecache — fast XMB Game menu for ARK-4 on big memory cards
 
+https://github.com/user-attachments/assets/0ac02283-8778-44a1-bbc5-bf59080ceb3e
+
 The load time to show items in my 128GB memory card was so frustrating!
 This plugin caches the data that slowed down you accessing your Game > Memory card.
 
