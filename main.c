@@ -189,6 +189,26 @@ static u64 space_free_bytes(const MsSpaceInfo *info)
     return (u64)info->free_clusters * info->sector_size * info->sector_count;
 }
 
+/*
+ * Total capacity of a device in bytes, 0 if not known yet.  Read from
+ * the snapshot the free-space hook already collected, never by issuing
+ * a fresh devctl: that call re-counts every free cluster on the card
+ * and is precisely the stall this plugin exists to remove.
+ *
+ * Caller must hold the global lock (gcache.c calls this from paths
+ * that already do), which is what serialises it against the writes in
+ * my_iodevctl below.
+ */
+u64 gc_dev_capacity(const char *dev)
+{
+    int i = space_dev_index(dev);
+
+    if (i < 0 || !g_space[i].valid)
+        return 0;
+    return (u64)g_space[i].info.max_clusters *
+           g_space[i].info.sector_size * g_space[i].info.sector_count;
+}
+
 int my_iodevctl(const char *dev, unsigned int cmd, void *indata, int inlen,
                 void *outdata, int outlen)
 {

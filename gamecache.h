@@ -123,6 +123,10 @@ void gc_lock(void);
 void gc_unlock(void);
 int  gc_init(void);
 
+/* main.c — card capacity in bytes from the free-space snapshot, 0 if
+ * not sampled yet.  Call with the lock held; never issues a devctl. */
+u64 gc_dev_capacity(const char *dev);
+
 void *gc_alloc(u32 size, SceUID *id);
 void gc_free(SceUID id);
 

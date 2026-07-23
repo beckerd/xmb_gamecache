@@ -104,9 +104,33 @@ an issue.
 - To force a full cache rebuild, delete `ms0:/PSP/SYSTEM/XMBGC.BIN`.
 - To reset the recently-played ordering, delete
   `ms0:/PSP/SYSTEM/XMBMRU.BIN`.
-- The cache file grows with your library (roughly 30–60 KB per game,
-  plus backgrounds you've viewed). It self-compacts by rebuilding when
-  bloat exceeds ~48 MB.
+- The cache file is capped in absolute size, scaled to the card it
+  lives on: 0.5% of capacity, clamped to 8–48 MB — about 10 MB on a
+  2 GB card, 20 MB on 4 GB, and the full 48 MB on anything 10 GB or
+  larger. The cap covers the whole file, not just its dead space, so a
+  library that is only ever added to cannot grow it without limit.
+
+## Staying inside the cap
+
+Roughly 30 KB per game goes on the metadata and icon that make the
+list itself instant; backgrounds, animated icons and menu music are
+much larger and are what actually fill the budget. When the cache
+reaches its cap, three things happen in order, cheapest first:
+
+1. **Trim** — the append point rolls back over any free space at the
+   end of the file, so adding a game and removing it again costs
+   nothing.
+2. **Evict** — the bulky media (ICON1/PIC0/PIC1/SND0) is dropped from
+   the least recently played games first. Every game keeps its title
+   and icon, so the list stays instant; a dropped background re-caches
+   by itself the next time you actually look at that game.
+3. **Compact** — the surviving data is rewritten into a fresh file,
+   which is what physically shrinks it on the card.
+
+Compaction is incremental: games keep their built state, so nothing
+goes cold and no ISO is re-scanned. Only if compaction fails outright
+(no room for the scratch file) does the plugin fall back to discarding
+the cache and rebuilding it.
 
 ## Known limitations
 

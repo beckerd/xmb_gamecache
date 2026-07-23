@@ -25,10 +25,42 @@
 #define GC_FILE_MAGIC   0x32434758      /* "XGC2" */
 #define GC_FILE_VERSION 2
 #define GC_HDR_SIZE     64
-#define GC_WASTE_LIMIT  (48 * 1024 * 1024)
 #define GC_IOBUF_SIZE   (32 * 1024)
 #define GC_INIT_CAP     256
 #define GC_FLUSH_EVERY  8
+
+/*
+ * Size budget.  The cache file is capped in absolute bytes, scaled to
+ * the card it lives on: a 2 GB card must not carry the same 50 MB of
+ * cache that is noise on a 128 GB one.  The budget bounds *total*
+ * bytes (live + dead) — bounding only the dead part lets a library
+ * that is merely added to, never deleted from, grow without limit.
+ *
+ * GC_SIZE_DIV of the card, clamped.  The floor keeps the budget large
+ * enough to hold the list-critical blobs (PARAM.SFO + ICON0, ~30 KB a
+ * game) for a big library even on a small card; the ceiling stops a
+ * huge card from handing out a budget nothing needs.
+ */
+#define GC_SIZE_DIV     200             /* 0.5% of the card             */
+#define GC_SIZE_MIN     (8 * 1024 * 1024)
+#define GC_SIZE_MAX     (48 * 1024 * 1024)
+#define GC_RECLAIM_PCT  75              /* compact down to this % of it */
+
+/*
+ * The ceiling is set by what reclamation costs, not by what the card
+ * could spare: ctx_compact rewrites the surviving data, so the stall
+ * scales with how much is kept (~0.33 s per MB on a Memory Stick).
+ * 48 MB puts the worst case around 16 s, and it only comes up after
+ * roughly a quarter of the budget has churned.  It is also the figure
+ * this plugin previously allowed for dead bytes *alone*, so the whole
+ * file is now held under what the garbage used to be.
+ *
+ * Little is lost by stopping there.  Metadata is what makes the list
+ * instant and costs ~30 KB a game, so even 400 games fit in 12 MB;
+ * the rest is media, and since eviction drops the coldest games
+ * first, the games actually being played keep theirs.  A larger cache
+ * would only buy instant backgrounds for games rarely opened.
+ */
 
 typedef struct __attribute__((packed)) {
     u32 magic;
@@ -52,6 +84,7 @@ typedef struct {
     const char *dev;        /* "ms0:" / "ef0:" */
     const char *data_path;
     const char *idx_path;
+    const char *tmp_path;   /* scratch file used by compaction */
     SceUID fd;              /* data file fd */
     int loaded;
     u32 count, cap;
@@ -59,6 +92,7 @@ typedef struct {
     SceUID e_id;
     u32 blob_end;
     u32 waste;
+    u32 limit;              /* absolute byte budget for this device */
     int pend;               /* mutations since last flush */
     u8 **mir;               /* [cap*GC_MIR_SECS] RAM-mirror ptrs, NULL = none */
     SceUID mir_id;
@@ -66,9 +100,11 @@ typedef struct {
 
 static CacheCtx g_ctx[2] = {
     { "ms0:", "ms0:/PSP/SYSTEM/XMBGC.BIN", "ms0:/PSP/SYSTEM/XMBGC.IDX",
-      -1, 0, 0, 0, NULL, -1, GC_HDR_SIZE, 0, 0, NULL, -1 },
+      "ms0:/PSP/SYSTEM/XMBGC.TMP",
+      -1, 0, 0, 0, NULL, -1, GC_HDR_SIZE, 0, GC_SIZE_MAX, 0, NULL, -1 },
     { "ef0:", "ef0:/PSP/SYSTEM/XMBGC.BIN", "ef0:/PSP/SYSTEM/XMBGC.IDX",
-      -1, 0, 0, 0, NULL, -1, GC_HDR_SIZE, 0, 0, NULL, -1 },
+      "ef0:/PSP/SYSTEM/XMBGC.TMP",
+      -1, 0, 0, 0, NULL, -1, GC_HDR_SIZE, 0, GC_SIZE_MAX, 0, NULL, -1 },
 };
 
 static SceUID g_sema = -1;
@@ -510,6 +546,7 @@ static void ctx_reset(CacheCtx *c)
     if (c->fd >= 0)
         ctx_close_file(c);
     sceIoRemove(c->idx_path);
+    sceIoRemove(c->tmp_path);
     c->fd = sceIoOpen(c->data_path, PSP_O_RDWR | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     write_data_header(c);
     gc_log("cache reset", c->dev, 0);
@@ -571,6 +608,9 @@ static void ctx_load(CacheCtx *c)
     c->blob_end = GC_HDR_SIZE;
     c->waste = 0;
     c->pend = 0;
+
+    /* scratch left behind by a compaction that was cut short */
+    sceIoRemove(c->tmp_path);
 
     if (ctx_open_file(c, 1) < 0)
         return;
@@ -677,17 +717,343 @@ static int get_sfo_u32(const char *sfo, const char *name, u32 *output)
     return -40;
 }
 
+/* bytes this entry occupies in the data file */
+static u32 entry_sect_bytes(CacheEntry *e, int i)
+{
+    if (!e->blob_off[i])
+        return 0;
+    return (i == 0) ? GC_SFO_SIZE : e->sect_size[i];
+}
+
+static u32 entry_blob_bytes(CacheEntry *e)
+{
+    u32 n = 0;
+    int i;
+    for (i = 0; i < 8; i++)
+        n += entry_sect_bytes(e, i);
+    return n;
+}
+
 static void entry_invalidate(CacheCtx *c, CacheEntry *e)
 {
-    int i;
     if (!(e->flags & GC_ENTRY_VALID))
         return;
-    for (i = 0; i < 8; i++) {
-        if (e->blob_off[i])
-            c->waste += (i == 0) ? GC_SFO_SIZE : e->sect_size[i];
-    }
+    c->waste += entry_blob_bytes(e);
     ctx_mir_drop(c, e);
     memset(e, 0, sizeof(*e));
+}
+
+/* ------------------------------------------------------------------ */
+/* size budget and reclamation                                         */
+/*                                                                     */
+/* Three mechanisms, cheapest first:                                   */
+/*   trim  - roll the append point back over blobs that ended up at    */
+/*           the tail, so add-then-remove churn costs nothing          */
+/*   evict - drop the bulky media sections (ICON1/PIC0/PIC1/SND0) from */
+/*           the coldest games, keeping the SFO+ICON0 that the list    */
+/*           view actually needs; they re-cache from the ISO on demand */
+/*   compact - copy the surviving blobs into a fresh file, which is    */
+/*           the only step that physically shrinks it                  */
+/*                                                                     */
+/* The old behaviour — truncate everything once dead bytes passed a    */
+/* fixed 48 MB — is now only the fallback for a failed compaction.     */
+/* ------------------------------------------------------------------ */
+
+static u32 ctx_live_bytes(CacheCtx *c)
+{
+    u32 i, n = 0;
+    for (i = 0; i < c->count; i++) {
+        if (c->e[i].flags & GC_ENTRY_VALID)
+            n += entry_blob_bytes(&c->e[i]);
+    }
+    return n;
+}
+
+/* byte budget for this device, from the free-space snapshot */
+static void ctx_update_limit(CacheCtx *c)
+{
+    u64 cap = gc_dev_capacity(c->dev);
+    u32 lim;
+
+    if (cap == 0) {
+        /* capacity not sampled yet: assume the permissive ceiling and
+         * re-derive on a later scan, once the XMB has asked for free
+         * space at least once */
+        c->limit = GC_SIZE_MAX;
+        return;
+    }
+    cap /= GC_SIZE_DIV;
+    if (cap > GC_SIZE_MAX)
+        lim = GC_SIZE_MAX;
+    else
+        lim = (u32)cap;
+    if (lim < GC_SIZE_MIN)
+        lim = GC_SIZE_MIN;
+    c->limit = lim;
+}
+
+/* would caching `size` more bytes put us over budget? */
+static int ctx_over_budget(CacheCtx *c, u32 size)
+{
+    if (c->blob_end >= c->limit)
+        return 1;
+    return size > c->limit - c->blob_end;
+}
+
+/*
+ * Roll blob_end back over any trailing free space.  Blobs are
+ * immutable and only ever appended, so everything above the highest
+ * live blob is dead and can be handed straight back to the allocator.
+ * One pass over the index, run after a batch of invalidations rather
+ * than per entry.  The file keeps its high-water size on the card
+ * until a compaction rewrites it; the reclaimed range is reused by
+ * the next append.
+ */
+static void ctx_trim_tail(CacheCtx *c)
+{
+    u32 i, hi = GC_HDR_SIZE;
+    int s;
+
+    for (i = 0; i < c->count; i++) {
+        CacheEntry *e = &c->e[i];
+        if (!(e->flags & GC_ENTRY_VALID))
+            continue;
+        for (s = 0; s < 8; s++) {
+            u32 end;
+            if (!e->blob_off[s])
+                continue;
+            end = e->blob_off[s] + entry_sect_bytes(e, s);
+            if (end > hi)
+                hi = end;
+        }
+    }
+    if (hi >= c->blob_end)
+        return;
+    {
+        u32 freed = c->blob_end - hi;
+        c->waste = (c->waste > freed) ? c->waste - freed : 0;
+        c->blob_end = hi;
+        c->pend++;
+        gc_log("cache trim", c->dev, freed);
+    }
+}
+
+/* drop one cached section, returning its bytes to the waste pool */
+static void evict_section(CacheCtx *c, CacheEntry *e, int s)
+{
+    u32 n = entry_sect_bytes(e, s);
+    if (n == 0)
+        return;
+    c->waste += n;
+    e->blob_off[s] = 0;
+    if (s < GC_MIR_SECS)
+        ctx_mir_set(c, e, s, NULL);
+    c->pend++;
+}
+
+/*
+ * Shed cached bytes until live data fits in `target`.  Media first and
+ * coldest first: a game that is not in the recently-played list loses
+ * its animated icon, backgrounds and menu music before a recent one
+ * does, and every game keeps its SFO+ICON0 until the last resort —
+ * those are what make the list itself instant, and they are ~30 KB a
+ * game against megabytes for the media.
+ */
+static void ctx_evict(CacheCtx *c, u32 target)
+{
+    static const int media[4] = { 2, 3, 4, 5 };   /* ICON1 PIC0 PIC1 SND0 */
+    u32 live = ctx_live_bytes(c);
+    int pass, k;
+    u32 i;
+
+    for (pass = 0; pass < 3 && live > target; pass++) {
+        for (i = 0; i < c->count && live > target; i++) {
+            CacheEntry *e = &c->e[i];
+            if (!(e->flags & GC_ENTRY_VALID))
+                continue;
+            /* pass 0: cold games only.  pass 1: any game.  pass 2:
+             * also give up ICON0, which only a huge library on a tiny
+             * card should ever reach. */
+            if (pass == 0 && mru_rank(e->path) >= 0)
+                continue;
+            for (k = 0; k < 4 && live > target; k++) {
+                u32 n = entry_sect_bytes(e, media[k]);
+                if (n == 0)
+                    continue;
+                evict_section(c, e, media[k]);
+                live -= n;
+            }
+            if (pass == 2 && live > target) {
+                u32 n = entry_sect_bytes(e, 1);
+                if (n > 0) {
+                    evict_section(c, e, 1);
+                    live -= n;
+                }
+            }
+        }
+    }
+    gc_log("cache evict", c->dev, live);
+}
+
+/* whole-file copy through the scratch buffer (compaction fallback) */
+static int copy_file(const char *src, const char *dst)
+{
+    SceUID s, d;
+    int ret = 0;
+
+    s = sceIoOpen(src, PSP_O_RDONLY, 0777);
+    if (s < 0)
+        return -1;
+    d = sceIoOpen(dst, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (d < 0) {
+        sceIoClose(s);
+        return -1;
+    }
+    for (;;) {
+        int n = sceIoRead(s, g_iobuf, GC_IOBUF_SIZE);
+        if (n < 0) {
+            ret = -1;
+            break;
+        }
+        if (n == 0)
+            break;
+        if (sceIoWrite(d, g_iobuf, n) != n) {
+            ret = -1;
+            break;
+        }
+    }
+    sceIoClose(d);
+    sceIoClose(s);
+    return ret;
+}
+
+/*
+ * Copy every surviving blob into a fresh file and swap it in.  This is
+ * the incremental alternative to wiping the cache: entries keep their
+ * built state, their synthesized SFO and their icons, so nothing goes
+ * cold and no ISO has to be re-walked.
+ *
+ * Crash safety comes from the ordering, not from a journal.  The index
+ * is deleted before the data file is swapped, so an interruption at
+ * any point leaves either the old data file or the new one with no
+ * index beside it — and ctx_load treats a missing/mismatched index as
+ * "rebuild", which is exactly the old behaviour.  A half-written
+ * scratch file is never visible under the real name.
+ */
+static int ctx_compact(CacheCtx *c)
+{
+    GcDataHeader h;
+    SceUID tfd;
+    u32 i, newend = GC_HDR_SIZE;
+    int s, ret = -1;
+
+    if (ensure_iobuf() < 0)
+        return -1;
+    if (ctx_open_file(c, 0) < 0)
+        return -1;
+
+    sceIoRemove(c->tmp_path);
+    tfd = sceIoOpen(c->tmp_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (tfd < 0)
+        return -1;
+
+    memset(&h, 0, sizeof(h));
+    if (sceIoWrite(tfd, &h, sizeof(h)) != (int)sizeof(h))
+        goto fail;
+
+    for (i = 0; i < c->count; i++) {
+        CacheEntry *e = &c->e[i];
+        if (!(e->flags & GC_ENTRY_VALID))
+            continue;
+        for (s = 0; s < 8; s++) {
+            u32 size = entry_sect_bytes(e, s);
+            u32 src = e->blob_off[s];
+            u32 pos = 0;
+            if (size == 0)
+                continue;
+            while (pos < size) {
+                u32 n = size - pos;
+                if (n > GC_IOBUF_SIZE)
+                    n = GC_IOBUF_SIZE;
+                if (ctx_pread(c, src + pos, g_iobuf, n) < 0)
+                    goto fail;
+                if (sceIoWrite(tfd, g_iobuf, n) != (int)n)
+                    goto fail;
+                pos += n;
+            }
+            e->blob_off[s] = newend;    /* src already consumed */
+            newend += size;
+        }
+    }
+
+    h.magic = GC_FILE_MAGIC;
+    h.version = GC_FILE_VERSION;
+    h.ark_magic = gc_ark_magic();
+    h.blob_end = newend;
+    h.waste = 0;
+    if (sceIoLseek32(tfd, 0, PSP_SEEK_SET) != 0)
+        goto fail;
+    if (sceIoWrite(tfd, &h, sizeof(h)) != (int)sizeof(h))
+        goto fail;
+    sceIoClose(tfd);
+    tfd = -1;
+
+    /* swap: index first, so any crash from here on lands on "rebuild" */
+    ctx_close_file(c);
+    sceIoRemove(c->idx_path);
+    sceIoRemove(c->data_path);
+    if (sceIoRename(c->tmp_path, c->data_path) < 0) {
+        /* rename is not dependable across every PSP filesystem; the
+         * old file is already gone, so copy the scratch into place
+         * rather than lose a cache we just spent the IO to build */
+        if (copy_file(c->tmp_path, c->data_path) < 0) {
+            sceIoRemove(c->tmp_path);
+            return -1;
+        }
+    }
+    sceIoRemove(c->tmp_path);
+
+    c->blob_end = newend;
+    c->waste = 0;
+    c->pend = 1;
+    ret = ctx_flush(c);
+    gc_log("cache compact", c->dev, newend);
+    return ret;
+
+fail:
+    if (tfd >= 0)
+        sceIoClose(tfd);
+    sceIoRemove(c->tmp_path);
+    return -1;
+}
+
+/*
+ * Bring the cache back inside its budget.  Called at list-build time,
+ * which is the only safe point: no virtual PBP read is in flight, so
+ * blob offsets can move.
+ */
+static void ctx_reclaim(CacheCtx *c)
+{
+    u32 target;
+
+    ctx_update_limit(c);
+    if (c->blob_end <= c->limit && c->waste <= (c->limit >> 1))
+        return;
+
+    target = (u32)(((u64)c->limit * GC_RECLAIM_PCT) / 100);
+    if (ctx_live_bytes(c) > target)
+        ctx_evict(c, target);
+    ctx_trim_tail(c);
+
+    /* Rolling back the tail is free and often enough on its own —
+     * rewriting the file is the one step here that costs real IO, so
+     * only pay for it if holes are actually left behind.  The caller
+     * flushes the index either way. */
+    if (c->blob_end <= c->limit && c->waste <= (c->limit >> 1))
+        return;
+
+    if (ctx_compact(c) < 0)
+        ctx_reset(c);       /* last resort: the old wipe-everything path */
 }
 
 /* copy an entire ISO section into the cache file, chunked */
@@ -933,8 +1299,7 @@ int gc_scan_dir(const char *isopath, u32 *emit, int cap)
         return -1;
 
     ctx_load(c);
-    if (c->waste > GC_WASTE_LIMIT)
-        ctx_reset(c);
+    ctx_reclaim(c);
 
     d = k_dopen(isopath);
     if (d < 0) {
@@ -945,6 +1310,7 @@ int gc_scan_dir(const char *isopath, u32 *emit, int cap)
                 c->pend++;
             }
         }
+        ctx_trim_tail(c);
         if (c->pend > 0)
             ctx_flush(c);
         gc_log("scan: no iso dir", isopath, (u32)d);
@@ -1017,6 +1383,7 @@ int gc_scan_dir(const char *isopath, u32 *emit, int cap)
         }
     }
 
+    ctx_trim_tail(c);
     if (c->pend > 0)
         ctx_flush(c);
     gc_log("scan done", isopath, (u32)cnt);
@@ -1084,8 +1451,15 @@ static int gc_read_inner(u32 comb, u32 gen, u32 *fp, void *data, int size)
                 /* lazily cache this section from the ISO, then serve it */
                 if (aff_open(e->path) < 0)
                     return -6;
-                if (cache_section_from_iso(c, e, sec) < 0) {
-                    /* can't cache (card full?): stream straight from ISO */
+                /* Over budget: serve the bytes but don't grow the file.
+                 * Reclaiming here is not an option — this read holds a
+                 * blob offset that compaction would move — so the cap
+                 * is enforced by refusing to append until the next
+                 * list build, which runs ctx_reclaim at a safe point. */
+                if (ctx_over_budget(c, e->sect_size[sec]) ||
+                    cache_section_from_iso(c, e, sec) < 0) {
+                    /* can't cache (over budget, or card full): stream
+                     * straight from the ISO */
                     u32 p2 = 0;
                     while (p2 < n) {
                         u32 m = n - p2;
